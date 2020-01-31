@@ -2,6 +2,7 @@ package microbatch
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"time"
 
@@ -9,6 +10,8 @@ import (
 )
 
 // Insert creates batches limited by the configured batch size.
+// Insert can be configured to return *sql.NullInt64 objects if
+// the query defines this.
 type Insert struct {
 	// a transaction to send the batch on
 	tx pgx.Tx
@@ -18,14 +21,18 @@ type Insert struct {
 	batchSize int
 	// the current queued inserts
 	currQueue int
-	// the total number of vulnerabilities indexed
+	// the total number of queued inserts
 	total int
 	// the timeout specified for a batch operation
 	timeout time.Duration
+	// whether we expect the Insert to return sql.NullInt64 IDs
+	returning bool
+	// a list of ids if returning option is used
+	ids []*sql.NullInt64
 }
 
 // NewInsert returns a new micro batcher for inserting vulnerabilities to the database.
-func NewInsert(tx pgx.Tx, batchSize int, timeout time.Duration) *Insert {
+func NewInsert(tx pgx.Tx, batchSize int, timeout time.Duration, returning bool) *Insert {
 	if timeout == 0 {
 		timeout = time.Minute
 	}
@@ -33,7 +40,14 @@ func NewInsert(tx pgx.Tx, batchSize int, timeout time.Duration) *Insert {
 		tx:        tx,
 		batchSize: batchSize,
 		timeout:   timeout,
+		returning: returning,
+		ids:       []*sql.NullInt64{},
 	}
+}
+
+// GetIDs returns any collected IDs from a returning sql statement
+func (v *Insert) GetIDs() []*sql.NullInt64 {
+	return v.ids
 }
 
 // Queue enqueues a query and its arguments into a batch.
@@ -75,9 +89,18 @@ func (v *Insert) Done(ctx context.Context) error {
 	defer res.Close()
 	defer cancel()
 	for i := 0; i < v.currQueue; i++ {
-		_, err := res.Exec()
-		if err != nil {
-			return fmt.Errorf("failed in exec iteration %d, %w", i, err)
+		if v.returning {
+			var id sql.NullInt64
+			err := res.QueryRow().Scan(&id)
+			if err != nil {
+				return fmt.Errorf("failed to query row: %d, %w", i, err)
+			}
+			v.ids = append(v.ids, &id)
+		} else {
+			_, err := res.Exec()
+			if err != nil {
+				return fmt.Errorf("failed in exec iteration %d, %w", i, err)
+			}
 		}
 	}
 	return nil
@@ -95,9 +118,18 @@ func (v *Insert) sendBatch(ctx context.Context) error {
 		v.currBatch = nil
 	}()
 	for i := 0; i < v.batchSize; i++ {
-		_, err := res.Exec()
-		if err != nil {
-			return err
+		if v.returning {
+			var id sql.NullInt64
+			err := res.QueryRow().Scan(&id)
+			if err != nil {
+				return fmt.Errorf("failed to query row: %d, %w", i, err)
+			}
+			v.ids = append(v.ids, &id)
+		} else {
+			_, err := res.Exec()
+			if err != nil {
+				return fmt.Errorf("failed in exec iteration %d, %w", i, err)
+			}
 		}
 	}
 	return nil

@@ -120,7 +120,7 @@ func putVulnerabilities(ctx context.Context, pool *pgxpool.Pool, updater string,
 
 	skipCt := 0
 	// safe sized batch inserts to postgres
-	mBatcher := microbatch.NewInsert(tx, 2000, time.Minute)
+	mBatcher := microbatch.NewInsert(tx, 2000, time.Minute, false)
 	for _, vuln := range vulns {
 		if vuln.Package == nil || vuln.Package.Name == "" {
 			skipCt++

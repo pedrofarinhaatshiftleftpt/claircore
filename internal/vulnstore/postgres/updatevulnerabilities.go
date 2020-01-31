@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v4"
 	"github.com/jackc/pgx/v4/pgxpool"
 	"github.com/quay/claircore"
 	"github.com/quay/claircore/libvuln/driver"
@@ -21,6 +22,18 @@ const (
 	insertUpdateOperationDiff = `
 	INSERT INTO update_diff (ou_id, kind, vuln_id)
 	VALUES ($1, $2, $3);
+	`
+	selectNewestUpdateOperation = `
+	SELECT (id) FROM updater_operation
+	WHERE updater = $1 ORDER BY date LIMIT 1;
+	`
+	selectVulnerabilityIDByUOID = `
+	SELECT (id) FROM vuln 
+	WHERE uo_id = $1;
+	`
+	updateVulnerabilityActiveFalse = `
+	UPDATE vuln SET active = false 
+	WHERE id = $1;
 	`
 	// insertVulnerability will either update an existing vulnerability with the latest UpdateOperation id and not return an ID on conflict
 	// or insert a new vulnerability and return an ID if no conflict is encountered.
@@ -72,7 +85,7 @@ const (
 	  $20,
 	  $21,
 	  true
-	) ON CONFLICT (hash) DO UPDATE SET ou_id = EXCLUDED.ou_id
+	) ON CONFLICT (hash) DO UPDATE SET ou_id = EXCLUDED.ou_id, active = true
 	RETURNING id; -- will only return if hash conflict did not occur
 	`
 )
@@ -86,6 +99,16 @@ func updateVulnerabilites(ctx context.Context, pool *pgxpool.Pool, updater strin
 	}
 	defer tx.Rollback(ctx)
 
+	// get previous UpdateOperation
+	var prevUOID string
+	err = tx.QueryRow(ctx, selectNewestUpdateOperation, updater).Scan(&prevUOID)
+	switch err {
+	case sql.ErrNoRows:
+		prevUOID = ""
+	default:
+		return fmt.Errorf("failed to retrieve previous UpdateOperation ID")
+	}
+
 	// create UpdateOperation
 	_, err = pool.Exec(ctx, insertUpdateOperation, UOID, updater, string(fingerprint))
 	if err != nil {
@@ -94,8 +117,7 @@ func updateVulnerabilites(ctx context.Context, pool *pgxpool.Pool, updater strin
 
 	// batch insert vulnerabilities and record added IDs
 	skipCt := 0
-	added := []sql.NullInt64{}
-	mBatcher := microbatch.NewInsert(tx, 2000, time.Minute)
+	mBatcher := microbatch.NewInsert(tx, 2000, time.Minute, true)
 	for _, vuln := range vulns {
 		if vuln.Package == nil || vuln.Package.Name == "" {
 			skipCt++
@@ -142,7 +164,62 @@ func updateVulnerabilites(ctx context.Context, pool *pgxpool.Pool, updater strin
 		return fmt.Errorf("failed to finish batch vulnerability insert: %v", err)
 	}
 
-	//
+	// if no previous UOID exists we do not need to
+	// create a diff. early return
+	if prevUOID == "" {
+		return nil
+	}
+
+	// gather removed and added and create diff
+	// added ids were collected via microbatcher
+	added := mBatcher.GetIDs()
+	var removed []*sql.NullInt64
+	// errors will be present during row access if exists
+	rows, err := tx.Query(ctx, selectVulnerabilityIDByUOID, prevUOID)
+	switch {
+	case err == pgx.ErrNoRows:
+		// check if error simply means no rows. hop out of switch if so
+	case err != nil:
+		// we have a legitimate error. return it
+		return fmt.Errorf("failed to retrieve vulns with previous UOID: %w", err)
+	default:
+		// collect removed vuln ids from query
+		for rows.Next() {
+			var removedID sql.NullInt64
+			err := rows.Scan(&removedID)
+			if err != nil {
+				return fmt.Errorf("failed to scan id of deleted record: %w", err)
+			}
+		}
+	}
+
+	// create added diffs
+	for _, addID := range added {
+		if addID.Valid {
+			_, err := tx.Exec(ctx, insertUpdateOperationDiff, UOID, "add", addID)
+			if err != nil {
+				return fmt.Errorf("failed to create added dif: %w", err)
+			}
+		}
+	}
+	// create remove diff and set removed ids to active=false
+	for _, removedID := range removed {
+		if removedID.Valid {
+			_, err := tx.Exec(ctx, insertUpdateOperationDiff, UOID, "delete", removedID)
+			if err != nil {
+				return fmt.Errorf("failed to create added dif: %w", err)
+			}
+			_, err = tx.Exec(ctx, updateVulnerabilityActiveFalse, removedID)
+			if err != nil {
+				return fmt.Errorf("failed to set record %d to active = false: %w", err)
+			}
+		}
+	}
+	err = tx.Commit(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+	return nil
 }
 
 // hashVuln creates an md5 from the vulnerability data used for
