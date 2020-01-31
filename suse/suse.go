@@ -71,7 +71,7 @@ func WithURL(uri, compression string) Option {
 	return func(up *Updater) error {
 		// Return any errors from the outer function.
 		switch {
-		case cerr != nil:
+		case cerr != nil
 			return cerr
 		case uerr != nil:
 			return uerr
